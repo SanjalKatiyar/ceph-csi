@@ -34,6 +34,7 @@ import (
 	utilexec "k8s.io/utils/exec"
 
 	csicommon "github.com/ceph/ceph-csi/internal/csi-common"
+	hc "github.com/ceph/ceph-csi/internal/health-checker"
 	rbderrors "github.com/ceph/ceph-csi/internal/rbd/errors"
 	"github.com/ceph/ceph-csi/internal/util"
 	"github.com/ceph/ceph-csi/internal/util/file"
@@ -49,12 +50,18 @@ type NodeServer struct {
 	*csicommon.DefaultNodeServer
 	// A map storing all volumes with ongoing operations so that additional operations
 	// for that same volume (as defined by VolumeID) return an Aborted error
-	VolumeLocks *util.IDLocker
+	VolumeLocks   *util.IDLocker
+	healthChecker hc.Manager
 
 	// ext4HasPrezeroedSupport indicates whether the ext4 filesystem has support for pre-zeroed blocks.
 	ext4HasPrezeroedSupport featureFlag
 	// xfsHasReflinkSupport indicates whether the xfs filesystem has support for reflink.
 	xfsHasReflinkSupport featureFlag
+}
+
+// SetHealthChecker configures the manager used for volume health checks.
+func (ns *NodeServer) SetHealthChecker(manager hc.Manager) {
+	ns.healthChecker = manager
 }
 
 // stageTransaction struct represents the state a transaction was when it either completed
@@ -377,6 +384,8 @@ func (ns *NodeServer) NodeStageVolume(
 		} else if !isNotMnt {
 			log.DebugLog(ctx, "rbd: volume %s is already mounted to %s, skipping", volID, stagingTargetPath)
 
+			ns.startSharedHealthChecker(ctx, volID, stagingTargetPath)
+
 			return &csi.NodeStageVolumeResponse{}, nil
 		}
 	}
@@ -397,6 +406,8 @@ func (ns *NodeServer) NodeStageVolume(
 		if err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
+
+		ns.startSharedHealthChecker(ctx, volID, stagingTargetPath)
 
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
@@ -435,6 +446,8 @@ func (ns *NodeServer) NodeStageVolume(
 		"rbd: successfully mounted volume %s to stagingTargetPath %s",
 		volID,
 		stagingTargetPath)
+
+	ns.startSharedHealthChecker(ctx, volID, stagingTargetPath)
 
 	return &csi.NodeStageVolumeResponse{}, nil
 }
@@ -825,6 +838,16 @@ func (ns *NodeServer) createStageMountPoint(ctx context.Context, mountPath strin
 	return nil
 }
 
+// startSharedHealthChecker starts a health-checker on the stagingTargetPath.
+// This checker can be shared between multiple containers.
+// TODO: Add health checker for block-mode volumes.
+func (ns *NodeServer) startSharedHealthChecker(ctx context.Context, volumeID, dir string) {
+	err := ns.healthChecker.StartSharedChecker(volumeID, dir, hc.StatCheckerType)
+	if err != nil {
+		log.WarningLog(ctx, "failed to start healthchecker: %v", err)
+	}
+}
+
 // NodePublishVolume mounts the volume mounted to the device path to the target
 // path.
 func (ns *NodeServer) NodePublishVolume(
@@ -1206,6 +1229,9 @@ func (ns *NodeServer) NodeUnpublishVolume(
 	}
 	defer ns.VolumeLocks.Release(targetPath)
 
+	// stop the health-checker that may have been started in NodeGetVolumeStats()
+	ns.healthChecker.StopChecker(req.GetVolumeId(), targetPath)
+
 	isMnt, err := ns.Mounter.IsMountPoint(targetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1262,6 +1288,8 @@ func (ns *NodeServer) NodeUnstageVolume(
 	}
 
 	volID := req.GetVolumeId()
+
+	ns.healthChecker.StopSharedChecker(volID)
 
 	if acquired := ns.VolumeLocks.TryAcquire(volID); !acquired {
 		log.ErrorLog(ctx, util.VolumeOperationAlreadyExistsFmt, volID)
@@ -1665,6 +1693,58 @@ func (ns *NodeServer) NodeGetVolumeStats(
 	}
 	defer ns.VolumeLocks.Release(targetPath)
 
+	// Health check first, return without stats if unhealthy.
+	healthy, msg := ns.healthChecker.IsHealthy(volumeId, targetPath)
+
+	// If healthy and an error is returned, it means that the checker was not
+	// started. This could happen when the node-plugin was restarted and the
+	// volume is already staged and published.
+	if healthy && msg != nil {
+		// Start a StatChecker for the mounted targetPath, this prevents
+		// writing a file in the user-visible location. Ideally a (shared)
+		// FileChecker is started with the stagingTargetPath, but we can't
+		// get the stagingPath from the request easily.
+		// TODO: resolve the stagingPath like rbd.getStagingPath() does
+		// NOTE: rbd.getStagingPath() uses os.Stat() internally which
+		// if called synchronously, could block indefinitely.
+
+		// TODO: Add health checker for block-mode volumes.
+		// NOTE: Currently os.Stat() on block-mode result is just details
+		// about the (local) device file, not about the actual
+		// (remote) block device that can be used through the file.
+
+		// Start the background checker but return
+		// immediately instead of calling os.Stat() on this goroutine.
+		// If the mount is unresponsive, os.Stat() would block,
+		// holding the VolumeLock (acquired above) and preventing all future
+		// calls for this path from reaching isHealthy().
+		// The background checker will do the stat(), the next periodic
+		// call will pick up the result (or detect the 75s timeout).
+		err = ns.healthChecker.StartChecker(volumeId, targetPath, hc.StatCheckerType)
+		if err != nil {
+			log.WarningLog(ctx, "failed to start healthchecker: %v", err)
+		}
+
+		return &csi.NodeGetVolumeStatsResponse{
+			VolumeCondition: &csi.VolumeCondition{
+				Abnormal: false,
+				Message:  "health checker started, status not yet available",
+			},
+		}, nil
+	}
+
+	// !healthy indicates a problem with the volume.
+	if !healthy {
+		return &csi.NodeGetVolumeStatsResponse{
+			VolumeCondition: &csi.VolumeCondition{
+				Abnormal: true,
+				Message:  msg.Error(),
+			},
+		}, nil
+	}
+
+	// warning: reaching here should mean that synchronous os.Stat()
+	// call is safe and will not indefinitely block/hang
 	stat, err := os.Stat(targetPath)
 	if err != nil {
 		if util.IsCorruptedMountError(err) {
@@ -1766,7 +1846,7 @@ func (ns *NodeServer) blockNodeGetVolumeStats(
 		},
 		VolumeCondition: &csi.VolumeCondition{
 			Abnormal: false,
-			Message:  "volume is in a healthy condition",
+			Message:  "block-mode health checking is not supported",
 		},
 	}, nil
 }
@@ -1794,7 +1874,7 @@ func getBlockMetrics(
 		},
 		VolumeCondition: &csi.VolumeCondition{
 			Abnormal: false,
-			Message:  "volume is in a healthy condition",
+			Message:  "block-mode health checking is not supported",
 		},
 	}, nil
 }
