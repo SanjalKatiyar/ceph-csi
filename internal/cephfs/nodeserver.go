@@ -950,10 +950,27 @@ func (ns *cephfsNodeServer) NodeGetVolumeStats(
 		// FileChecker is started with the stagingTargetPath, but we can't
 		// get the stagingPath from the request easily.
 		// TODO: resolve the stagingPath like rbd.getStagingPath() does
+		// NOTE: rbd.getStagingPath() uses os.Stat() internally which
+		// if called synchronously, could block indefinitely.
+
+		// Start the background checker but return
+		// immediately instead of calling os.Stat() on this goroutine.
+		// If the mount is unresponsive, os.Stat() would block,
+		// holding the VolumeLock (acquired above) and preventing all future
+		// calls for this path from reaching isHealthy().
+		// The background checker will do the stat(), the next periodic
+		// call will pick up the result (or detect the 75s timeout).
 		err = ns.healthChecker.StartChecker(req.GetVolumeId(), targetPath, hc.StatCheckerType)
 		if err != nil {
 			log.WarningLog(ctx, "failed to start healthchecker: %v", err)
 		}
+
+		return &csi.NodeGetVolumeStatsResponse{
+			VolumeCondition: &csi.VolumeCondition{
+				Abnormal: false,
+				Message:  "health checker started, status not yet available",
+			},
+		}, nil
 	}
 
 	// !healthy indicates a problem with the volume
@@ -966,7 +983,8 @@ func (ns *cephfsNodeServer) NodeGetVolumeStats(
 		}, nil
 	}
 
-	// warning: stat() may hang on an unhealthy volume
+	// warning: reaching here should mean that synchronous os.Stat()
+	// call is safe and will not indefinitely block/hang
 	stat, err := os.Stat(targetPath)
 	if err != nil {
 		if util.IsCorruptedMountError(err) {
